@@ -5,7 +5,7 @@ package analyses
 
 import scala.annotation.switch
 import scala.annotation.tailrec
-import java.io.File
+import java.io.{DataInputStream, File}
 import java.lang.ref.SoftReference
 import java.net.URL
 import java.util.Arrays.{sort => sortArray}
@@ -15,9 +15,7 @@ import scala.collection.Map
 import scala.collection.Set
 import scala.collection.immutable
 import scala.collection.mutable
-import scala.collection.mutable.AnyRefMap
-import scala.collection.mutable.ArrayBuffer
-import scala.collection.mutable.Buffer
+import scala.collection.mutable.{AnyRefMap, ArrayBuffer, Buffer, ListBuffer}
 import com.typesafe.config.Config
 import com.typesafe.config.ConfigFactory
 import org.opalj.log.Error
@@ -44,6 +42,7 @@ import org.opalj.br.reader.BytecodeInstructionsCache
 import org.opalj.br.reader.Java17FrameworkWithDynamicRewritingAndCaching
 import org.opalj.br.reader.Java17LibraryFramework
 
+import java.util.jar.JarInputStream
 import scala.collection.immutable.ArraySeq
 
 /**
@@ -1674,6 +1673,40 @@ object Project {
             config = config,
             logContext
         )
+    }
+
+    def apply(projectJarStream: JarInputStream,
+              logContext: LogContext,
+              config: Config,
+              baseURL: Option[URL]): Project[URL] = {
+
+        val reader = JavaClassFileReader(logContext, config)
+        var currentEntry = projectJarStream.getNextEntry
+        val projectClasses = new ListBuffer[(ClassFile, URL)]()
+
+        while(currentEntry != null) {
+            val entryPath = currentEntry.getName
+
+            if(entryPath.toLowerCase.endsWith(".class")){
+                reader.ClassFile(new DataInputStream(projectJarStream))
+                  .map(cf => (cf, new URL("jar:" + baseURL.toString + "!/" + currentEntry.getName)))
+                  .foreach(projectClasses.addOne)
+            }
+
+            currentEntry = projectJarStream.getNextEntry
+        }
+
+        this(
+            projectClassFilesWithSources = projectClasses.toList,
+            libraryClassFilesWithSources = Iterable.empty,
+            libraryClassFilesAreInterfacesOnly = true,
+            virtualClassFiles = Iterable.empty,
+            handleInconsistentProject = defaultHandlerForInconsistentProjects,
+            config = config,
+            logContext
+        )
+
+
     }
 
     def apply(

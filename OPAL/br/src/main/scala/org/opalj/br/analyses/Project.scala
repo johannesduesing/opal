@@ -224,6 +224,13 @@ class Project[Source] private (
         )
     }
 
+    private var performanceMetrics = Map.empty[String, Long]
+    def addPerformanceMetrics(metrics: Map[String, Long]): Unit ={
+        metrics.foreach { case (name: String, value: Long) => this.performanceMetrics = this.performanceMetrics ++ Map(name -> value) }
+    }
+
+    def getPerformanceMetrics: Map[String, Long] = this.performanceMetrics
+
     /* ------------------------------------------------------------------------------------------ *\
     |                                                                                              |
     |                                                                                              |
@@ -249,7 +256,7 @@ class Project[Source] private (
      */
     // TODO Consider extracting to a ProjectInformationKey
     // TODO Java 9+
-    final val classesPerPackage: immutable.Map[String, immutable.Set[ClassFile]] = {
+    final val classesPerPackage: immutable.Map[String, immutable.Set[ClassFile]] = time {
         val classesPerPackage = mutable.Map.empty[String, ArrayBuffer[ClassFile]]
         allClassFiles foreach { cf =>
             val packageName = cf.thisType.packageName
@@ -264,7 +271,7 @@ class Project[Source] private (
             buffer += cf
         }
         immutable.Map.from(classesPerPackage.iterator.map { case (key, cfs) => (key, cfs.toSet) })
-    }
+    }{ t => this.addPerformanceMetrics(Map("classes-per-package" -> t.toMilliseconds.timeSpan))}
 
     /**
      * Computes the set of all definitive functional interfaces in a top-down fashion.
@@ -1892,6 +1899,14 @@ object Project {
         implicit val projectConfig: Config = config
         implicit val projectLogContext: LogContext = logContext
 
+        var chTimeMs: Long = -1L
+        var pClassFileTimeMs: Long = -1L
+        var lClassFileTimeMs: Long = -1L
+        var instanceMethodsTimeMs: Long = -1L
+        var overridingMethodsTimeMs: Long = -1L
+        var pValidationTimeMs: Long = -1L
+
+
         try {
             import scala.collection.mutable.Set
             import scala.concurrent.Await
@@ -1921,7 +1936,10 @@ object Project {
                             virtualClassFiles,
                         typeHierarchyDefinitions
                     )
-                } { t => info("project setup", s"computing type hierarchy took ${t.toSeconds}") }
+                } { t =>
+                    chTimeMs = t.toMilliseconds.timeSpan
+                    info("project setup", s"computing type hierarchy took ${t.toSeconds}")
+                }
             }(ScalaExecutionContext)
 
             val projectModules = AnyRefMap.empty[String, ModuleDefinition[Source]]
@@ -2026,79 +2044,83 @@ object Project {
                 }
             }
 
-            for ((classFile, source) <- projectClassFilesWithSources) {
-                processProjectClassFile(classFile, Some(source))
-            }
+            time {
+                for ((classFile, source) <- projectClassFilesWithSources) {
+                    processProjectClassFile(classFile, Some(source))
+                }
 
-            for (classFile <- virtualClassFiles) {
-                processProjectClassFile(classFile, None)
-            }
+                for (classFile <- virtualClassFiles) {
+                    processProjectClassFile(classFile, None)
+                }
+            }{t => pClassFileTimeMs = t.toMilliseconds.timeSpan}
 
-            // The set `libraryTypes` is only used to improve the identification of
-            // inconsistent projects while loading libraries.
-            val libraryTypes = Set.empty[ObjectType]
-            for ((libClassFile, source) <- libraryClassFilesWithSources) {
-                val libraryType = libClassFile.thisType
+            time {
+                // The set `libraryTypes` is only used to improve the identification of
+                // inconsistent projects while loading libraries.
+                val libraryTypes = Set.empty[ObjectType]
+                for ((libClassFile, source) <- libraryClassFilesWithSources) {
+                    val libraryType = libClassFile.thisType
 
-                if (libClassFile.isModuleDeclaration) {
-                    processModule(libClassFile, Some(source), libraryModules)
+                    if (libClassFile.isModuleDeclaration) {
+                        processModule(libClassFile, Some(source), libraryModules)
 
-                } else if (projectTypes.contains(libClassFile.thisType)) {
-                    val libraryTypeQualifier =
-                        if (libClassFile.isInterfaceDeclaration) "interface" else "class"
-                    val projectTypeQualifier = {
-                        val projectClassFile = projectClassFiles.find(_.thisType == libraryType).get
-                        if (projectClassFile.isInterfaceDeclaration) "interface" else "class"
-                    }
+                    } else if (projectTypes.contains(libClassFile.thisType)) {
+                        val libraryTypeQualifier =
+                            if (libClassFile.isInterfaceDeclaration) "interface" else "class"
+                        val projectTypeQualifier = {
+                            val projectClassFile = projectClassFiles.find(_.thisType == libraryType).get
+                            if (projectClassFile.isInterfaceDeclaration) "interface" else "class"
+                        }
 
-                    handleInconsistentProject(
-                        logContext,
-                        InconsistentProjectException(
-                            s"${libraryType.toJava} is defined by the project and a library: " +
-                                sources.getOrElse(libraryType, "<VIRTUAL>") + " and " +
-                                source.toString + "; keeping the project class file."
-                        )
-                    )
-
-                    if (libraryTypeQualifier != projectTypeQualifier) {
                         handleInconsistentProject(
                             logContext,
                             InconsistentProjectException(
-                                s"the kind of the type ${libraryType.toJava} " +
-                                    s"defined by the project ($projectTypeQualifier) " +
-                                    s"and a library ($libraryTypeQualifier) differs"
+                                s"${libraryType.toJava} is defined by the project and a library: " +
+                                    sources.getOrElse(libraryType, "<VIRTUAL>") + " and " +
+                                    source.toString + "; keeping the project class file."
                             )
                         )
-                    }
 
-                } else if (libraryTypes.contains(libraryType)) {
-                    handleInconsistentProject(
-                        logContext,
-                        InconsistentProjectException(
-                            s"${libraryType.toJava} is defined multiple times in the libraries: " +
-                                sources.getOrElse(libraryType, "<VIRTUAL>") + " and " +
-                                source.toString + "; keeping the first one."
+                        if (libraryTypeQualifier != projectTypeQualifier) {
+                            handleInconsistentProject(
+                                logContext,
+                                InconsistentProjectException(
+                                    s"the kind of the type ${libraryType.toJava} " +
+                                        s"defined by the project ($projectTypeQualifier) " +
+                                        s"and a library ($libraryTypeQualifier) differs"
+                                )
+                            )
+                        }
+
+                    } else if (libraryTypes.contains(libraryType)) {
+                        handleInconsistentProject(
+                            logContext,
+                            InconsistentProjectException(
+                                s"${libraryType.toJava} is defined multiple times in the libraries: " +
+                                    sources.getOrElse(libraryType, "<VIRTUAL>") + " and " +
+                                    source.toString + "; keeping the first one."
+                            )
                         )
-                    )
-                } else {
-                    libraryClassFiles ::= libClassFile
-                    libraryTypes += libraryType
-                    libraryClassFilesCount += 1
-                    for (method <- libClassFile.methods) {
-                        libraryMethodsCount += 1
-                        method.body.foreach(codeSize += _.instructions.length)
+                    } else {
+                        libraryClassFiles ::= libClassFile
+                        libraryTypes += libraryType
+                        libraryClassFilesCount += 1
+                        for (method <- libClassFile.methods) {
+                            libraryMethodsCount += 1
+                            method.body.foreach(codeSize += _.instructions.length)
+                        }
+                        libraryFieldsCount += libClassFile.fields.size
+                        objectTypeToClassFile(libraryType) = libClassFile
+                        sources(libraryType) = source
+                        processNestInformation(libClassFile, libraryType)
                     }
-                    libraryFieldsCount += libClassFile.fields.size
-                    objectTypeToClassFile(libraryType) = libClassFile
-                    sources(libraryType) = source
-                    processNestInformation(libClassFile, libraryType)
                 }
-            }
+            }{t => lClassFileTimeMs = t.toMilliseconds.timeSpan}
 
             val classHierarchy = Await.result(classHierarchyFuture, Duration.Inf)
 
             val instanceMethodsFuture = Future {
-                this.instanceMethods(classHierarchy, objectTypeToClassFile.get)
+                time { this.instanceMethods(classHierarchy, objectTypeToClassFile.get)}{ t => instanceMethodsTimeMs = t.toMilliseconds.timeSpan }
             }
 
             val projectClassFilesArray = projectClassFiles.toArray
@@ -2114,7 +2136,7 @@ object Project {
             val virtualMethodsCount: Int = allMethods.count(m => m.isVirtualMethodDeclaration)
 
             val overridingMethodsFuture = Future {
-                this.overridingMethods(classHierarchy, virtualMethodsCount, objectTypeToClassFile)
+                time { this.overridingMethods(classHierarchy, virtualMethodsCount, objectTypeToClassFile) }{ t => overridingMethodsTimeMs = t.toMilliseconds.timeSpan }
             }
 
             val methodsWithBodySortedBySizeWithContext =
@@ -2214,7 +2236,18 @@ object Project {
                                 ""
                         )
                 )
-            } { t => info("project setup", s"validating the project took ${t.toSeconds}") }
+            } { t =>
+                pValidationTimeMs = t.toMilliseconds.timeSpan
+                info("project setup", s"validating the project took ${t.toSeconds}") }
+
+            project.addPerformanceMetrics(Map(
+                "class-hierarchy" -> chTimeMs,
+                "project-class-files" -> pClassFileTimeMs,
+                "library-class-files" -> lClassFileTimeMs,
+                "instance-methods" -> instanceMethodsTimeMs,
+                "overriding-methods" -> overridingMethodsTimeMs,
+                "validation" -> pValidationTimeMs
+            ))
 
             project
         } catch {
